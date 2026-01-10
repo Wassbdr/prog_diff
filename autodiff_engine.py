@@ -450,6 +450,205 @@ class Flatten(Module):
         return x.flatten()
 
 
+# =============================================================================
+# COUCHES CONVOLUTIONNELLES
+# =============================================================================
+
+class Conv2d(Module):
+    """
+    Couche de convolution 2D.
+    Input: (batch, in_channels, height, width)
+    Output: (batch, out_channels, out_height, out_width)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)
+        self.stride = stride if isinstance(stride, tuple) else (stride, stride)
+        self.padding = padding if isinstance(padding, tuple) else (padding, padding)
+        
+        # Initialisation Xavier
+        k = 1.0 / (in_channels * self.kernel_size[0] * self.kernel_size[1])
+        self.weight = Tensor(
+            np.random.uniform(-np.sqrt(k), np.sqrt(k), 
+                            (out_channels, in_channels, self.kernel_size[0], self.kernel_size[1]))
+        )
+        self.bias = Tensor(np.zeros(out_channels))
+        self._parameters = [self.weight, self.bias]
+    
+    def forward(self, x):
+        batch_size, in_channels, in_height, in_width = x.data.shape
+        kh, kw = self.kernel_size
+        sh, sw = self.stride
+        ph, pw = self.padding
+        
+        # Padding
+        if ph > 0 or pw > 0:
+            x_padded = np.pad(x.data, ((0, 0), (0, 0), (ph, ph), (pw, pw)), mode='constant')
+        else:
+            x_padded = x.data
+        
+        # Output dimensions
+        out_height = (in_height + 2 * ph - kh) // sh + 1
+        out_width = (in_width + 2 * pw - kw) // sw + 1
+        
+        # im2col transformation pour efficacité
+        col = np.zeros((batch_size, in_channels, kh, kw, out_height, out_width))
+        for i in range(kh):
+            i_max = i + sh * out_height
+            for j in range(kw):
+                j_max = j + sw * out_width
+                col[:, :, i, j, :, :] = x_padded[:, :, i:i_max:sh, j:j_max:sw]
+        
+        col = col.transpose(0, 4, 5, 1, 2, 3).reshape(batch_size * out_height * out_width, -1)
+        weight_col = self.weight.data.reshape(self.out_channels, -1).T
+        
+        out_data = col @ weight_col + self.bias.data
+        out_data = out_data.reshape(batch_size, out_height, out_width, self.out_channels)
+        out_data = out_data.transpose(0, 3, 1, 2)
+        
+        out = Tensor(out_data, (x, self.weight, self.bias), 'conv2d')
+        
+        # Sauvegarder pour backward
+        saved_col = col
+        saved_x_padded_shape = x_padded.shape
+        saved_x_shape = x.data.shape
+        
+        def _backward():
+            # Gradient par rapport au bias
+            self.bias.grad = self.bias.grad + np.sum(out.grad, axis=(0, 2, 3))
+            
+            # Gradient par rapport aux poids
+            dout_reshaped = out.grad.transpose(0, 2, 3, 1).reshape(-1, self.out_channels)
+            dW = saved_col.T @ dout_reshaped
+            self.weight.grad = self.weight.grad + dW.T.reshape(self.weight.data.shape)
+            
+            # Gradient par rapport à l'entrée
+            dcol = dout_reshaped @ self.weight.data.reshape(self.out_channels, -1)
+            dcol = dcol.reshape(batch_size, out_height, out_width, in_channels, kh, kw)
+            dcol = dcol.transpose(0, 3, 4, 5, 1, 2)
+            
+            dx_padded = np.zeros(saved_x_padded_shape)
+            for i in range(kh):
+                i_max = i + sh * out_height
+                for j in range(kw):
+                    j_max = j + sw * out_width
+                    dx_padded[:, :, i:i_max:sh, j:j_max:sw] += dcol[:, :, i, j, :, :]
+            
+            if ph > 0 or pw > 0:
+                x.grad = x.grad + dx_padded[:, :, ph:-ph, pw:-pw]
+            else:
+                x.grad = x.grad + dx_padded
+        
+        out._backward = _backward
+        return out
+
+
+class MaxPool2d(Module):
+    """
+    Max Pooling 2D.
+    Réduit les dimensions spatiales en prenant le maximum sur des fenêtres.
+    """
+    def __init__(self, kernel_size, stride=None):
+        super().__init__()
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)
+        self.stride = stride if stride is not None else self.kernel_size
+        if not isinstance(self.stride, tuple):
+            self.stride = (self.stride, self.stride)
+    
+    def forward(self, x):
+        batch_size, channels, in_height, in_width = x.data.shape
+        kh, kw = self.kernel_size
+        sh, sw = self.stride
+        
+        out_height = (in_height - kh) // sh + 1
+        out_width = (in_width - kw) // sw + 1
+        
+        # Reshape pour le pooling
+        out_data = np.zeros((batch_size, channels, out_height, out_width))
+        max_indices = np.zeros((batch_size, channels, out_height, out_width, 2), dtype=int)
+        
+        for i in range(out_height):
+            for j in range(out_width):
+                h_start = i * sh
+                w_start = j * sw
+                window = x.data[:, :, h_start:h_start+kh, w_start:w_start+kw]
+                
+                # Trouver le max et son indice
+                window_reshaped = window.reshape(batch_size, channels, -1)
+                max_idx = np.argmax(window_reshaped, axis=2)
+                out_data[:, :, i, j] = np.max(window_reshaped, axis=2)
+                
+                # Sauvegarder les indices pour backward
+                max_indices[:, :, i, j, 0] = h_start + max_idx // kw
+                max_indices[:, :, i, j, 1] = w_start + max_idx % kw
+        
+        out = Tensor(out_data, (x,), 'maxpool2d')
+        saved_indices = max_indices
+        saved_input_shape = x.data.shape
+        
+        def _backward():
+            dx = np.zeros(saved_input_shape)
+            for i in range(out_height):
+                for j in range(out_width):
+                    for b in range(batch_size):
+                        for c in range(channels):
+                            h_idx = saved_indices[b, c, i, j, 0]
+                            w_idx = saved_indices[b, c, i, j, 1]
+                            dx[b, c, h_idx, w_idx] += out.grad[b, c, i, j]
+            x.grad = x.grad + dx
+        
+        out._backward = _backward
+        return out
+
+
+class AvgPool2d(Module):
+    """
+    Average Pooling 2D.
+    Réduit les dimensions spatiales en prenant la moyenne sur des fenêtres.
+    """
+    def __init__(self, kernel_size, stride=None):
+        super().__init__()
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)
+        self.stride = stride if stride is not None else self.kernel_size
+        if not isinstance(self.stride, tuple):
+            self.stride = (self.stride, self.stride)
+    
+    def forward(self, x):
+        batch_size, channels, in_height, in_width = x.data.shape
+        kh, kw = self.kernel_size
+        sh, sw = self.stride
+        
+        out_height = (in_height - kh) // sh + 1
+        out_width = (in_width - kw) // sw + 1
+        
+        out_data = np.zeros((batch_size, channels, out_height, out_width))
+        
+        for i in range(out_height):
+            for j in range(out_width):
+                h_start = i * sh
+                w_start = j * sw
+                window = x.data[:, :, h_start:h_start+kh, w_start:w_start+kw]
+                out_data[:, :, i, j] = np.mean(window, axis=(2, 3))
+        
+        out = Tensor(out_data, (x,), 'avgpool2d')
+        pool_size = kh * kw
+        
+        def _backward():
+            dx = np.zeros(x.data.shape)
+            for i in range(out_height):
+                for j in range(out_width):
+                    h_start = i * sh
+                    w_start = j * sw
+                    dx[:, :, h_start:h_start+kh, w_start:w_start+kw] += \
+                        out.grad[:, :, i:i+1, j:j+1] / pool_size
+            x.grad = x.grad + dx
+        
+        out._backward = _backward
+        return out
+
+
 class Dropout(Module):
     """
     Dropout pour la régularisation.
@@ -740,6 +939,21 @@ class Adagrad(Optimizer):
             param.data = param.data - self.learning_rate * param.grad / (np.sqrt(self.cache[i]) + self.eps)
 
 
+class Momentum(Optimizer):
+    """SGD avec Momentum (comme dans le cours a.ipynb)"""
+    
+    def __init__(self, params, learning_rate=0.01, momentum=0.9):
+        super().__init__(params)
+        self.learning_rate = learning_rate
+        self.momentum = momentum
+        self.velocity = [np.zeros_like(p.data) for p in params]
+    
+    def step(self):
+        for i, param in enumerate(self.params):
+            self.velocity[i] = self.momentum * self.velocity[i] - self.learning_rate * param.grad
+            param.data = param.data + self.velocity[i]
+
+
 # =============================================================================
 # LEARNING RATE SCHEDULERS
 # =============================================================================
@@ -865,3 +1079,147 @@ def load_model(module, filepath):
     for i, param in enumerate(module.parameters()):
         param.data = data[str(i)]
     print(f"Model loaded from {filepath}")
+
+
+# =============================================================================
+# FONCTIONS DU COURS (a.ipynb) - Fonctions d'activation externes
+# =============================================================================
+
+def sin_d(dual_number: Tensor):
+    """Sinus avec autodiff inverse (comme dans le cours a.ipynb)"""
+    out = Tensor(np.sin(dual_number.data), (dual_number,), 'sin')
+    def _backward():
+        dual_number.grad += np.cos(dual_number.data) * out.grad
+    out._backward = _backward
+    return out
+
+
+def cos_d(dual_number: Tensor):
+    """Cosinus avec autodiff inverse (comme dans le cours a.ipynb)"""
+    out = Tensor(np.cos(dual_number.data), (dual_number,), 'cos')
+    def _backward():
+        dual_number.grad += -np.sin(dual_number.data) * out.grad
+    out._backward = _backward
+    return out
+
+
+def tan_d(dual_number: Tensor):
+    """Tangente avec autodiff inverse (comme dans le cours a.ipynb)"""
+    out = Tensor(np.tan(dual_number.data), (dual_number,), 'tan')
+    def _backward():
+        dual_number.grad += (1 / np.cos(dual_number.data)**2) * out.grad
+    out._backward = _backward
+    return out
+
+
+def sigmoid_d(dual_number: Tensor):
+    """Sigmoid avec autodiff inverse (comme dans le cours a.ipynb)"""
+    out = Tensor(1 / (1 + np.exp(-dual_number.data)), (dual_number,), 'sigmoid')
+    def _backward():
+        dual_number.grad += out.data * (1 - out.data) * out.grad
+    out._backward = _backward
+    return out
+
+
+def tanh_d(dual_number: Tensor):
+    """Tanh avec autodiff inverse (comme dans le cours a.ipynb)"""
+    out = Tensor(np.tanh(dual_number.data), (dual_number,), 'tanh')
+    def _backward():
+        dual_number.grad += (1 - out.data**2) * out.grad
+    out._backward = _backward
+    return out
+
+
+def relu_d(dual_number: Tensor):
+    """ReLU avec autodiff inverse"""
+    out = Tensor(np.maximum(0, dual_number.data), (dual_number,), 'relu')
+    def _backward():
+        dual_number.grad += (dual_number.data > 0).astype(float) * out.grad
+    out._backward = _backward
+    return out
+
+
+def sqrt_d(dual_number: Tensor):
+    """Racine carrée avec autodiff inverse (comme dans le cours a.ipynb)"""
+    out = Tensor(np.sqrt(dual_number.data), (dual_number,), 'sqrt')
+    def _backward():
+        dual_number.grad += (0.5 / np.sqrt(dual_number.data)) * out.grad
+    out._backward = _backward
+    return out
+
+
+def pow_d(dual_number: Tensor, power: int):
+    """Puissance avec autodiff inverse (comme dans le cours a.ipynb)"""
+    out = Tensor(dual_number.data ** power, (dual_number,), f'**{power}')
+    def _backward():
+        dual_number.grad += (power * dual_number.data ** (power - 1)) * out.grad
+    out._backward = _backward
+    return out
+
+
+def exp_d(dual_number: Tensor):
+    """Exponentielle avec autodiff inverse"""
+    out = Tensor(np.exp(dual_number.data), (dual_number,), 'exp')
+    def _backward():
+        dual_number.grad += out.data * out.grad
+    out._backward = _backward
+    return out
+
+
+def log_d(dual_number: Tensor):
+    """Logarithme avec autodiff inverse"""
+    out = Tensor(np.log(dual_number.data + 1e-8), (dual_number,), 'log')
+    def _backward():
+        dual_number.grad += out.grad / (dual_number.data + 1e-8)
+    out._backward = _backward
+    return out
+
+
+def softmax_d(dual_number: Tensor):
+    """Softmax avec autodiff inverse (comme dans le cours a.ipynb)"""
+    exp_vals = np.exp(dual_number.data - np.max(dual_number.data))  # Stabilité numérique
+    out = Tensor(exp_vals / np.sum(exp_vals), (dual_number,), 'softmax')
+    def _backward():
+        dual_number.grad += out.grad
+    out._backward = _backward
+    return out
+
+
+# =============================================================================
+# FONCTIONS RÉSEAU DU COURS (a.ipynb)
+# =============================================================================
+
+def func_nn(x, W1, b1, W2, b2):
+    """
+    MLP avec 1 couche cachée (comme dans le cours a.ipynb)
+    Architecture: x -> tanh(W1*x + b1) -> W2*h + b2 -> y
+    """
+    h1 = tanh_d(W1 * x + b1)
+    y = W2 * h1 + b2
+    return y
+
+
+def mse(y, y_hat):
+    """
+    Mean Squared Error (comme dans le cours a.ipynb)
+    loss = (y - y_hat)^2
+    """
+    return (y - y_hat) ** 2
+
+
+def func_rnn(x, h, Wx, Wh, b):
+    """
+    Cellule RNN simple (comme dans le cours a.ipynb)
+    h_new = tanh(Wx*x + Wh*h + b)
+    """
+    h_new = tanh_d(Wx * x + Wh * h + b)
+    return h_new
+
+
+def func_nn_output(h, Wy, by):
+    """
+    Couche de sortie pour RNN (comme dans le cours a.ipynb)
+    y = Wy*h + by
+    """
+    y = Wy * h + by
+    return y

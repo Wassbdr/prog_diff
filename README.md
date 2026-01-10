@@ -20,6 +20,7 @@ Implementation from scratch d'un moteur d'autodifferenciation en Python avec Num
 prog_diff/
 ├── autodiff_engine.py          # Moteur d'autodifferenciation
 ├── micro_pytorch_project.ipynb # Notebook avec exemples et MNIST
+├── cours.ipynb                     # Notebook du cours (référence)
 ├── requirements.txt            # Dependances
 └── README.md
 ```
