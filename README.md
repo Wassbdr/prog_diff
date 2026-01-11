@@ -1,4 +1,4 @@
-# Micro-PyTorch : Moteur d'Autodifferenciation
+# Micro-PyTorch : Moteur d'Autodifferenciation - Wassim Badraoui & Alexandra Da Silva
 
 ## Description
 
